@@ -1,0 +1,24 @@
+# Build artifacts
+*.o
+*.so
+*.bc
+*.dylib
+*.dll
+
+# PostgreSQL extension files
+results/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Backup files
+*.bak
+*.orig

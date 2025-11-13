@@ -1,0 +1,8 @@
+# pcst_fast extension
+comment = 'Prize Collecting Steiner Tree Fast algorithm for PostgreSQL'
+default_version = '1.0.0'
+module_pathname = '$libdir/pcst_fast'
+relocatable = false
+requires = ''
+superuser = false
+trusted = true
