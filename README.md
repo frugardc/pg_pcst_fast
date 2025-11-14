@@ -7,7 +7,8 @@ This extension wraps the PCST Fast algorithm from [fraenkel-lab/pcst_fast](https
 ## Features
 
 - **pg_routing-style interface** - Use SQL queries to define your graph, just like pg_routing
-- **Automatic ID mapping** - Works with your actual database IDs, no need to convert to 0-based indices
+- **Automatic ID mapping** - Works with your actual database IDs (integers or text), no need to convert to 0-based indices
+- **Flexible ID types** - Supports both integer and text-based node/edge IDs (including UUIDs, location codes, etc.)
 - High-performance C++ implementation of the PCST Fast algorithm
 - Supports multiple pruning methods (none, simple, gw, strong)
 - Configurable root nodes and clustering options
@@ -107,24 +108,41 @@ The main function `pgr_pcst_fast()` uses a pg_routing-style interface where you 
 
 #### Function Signature
 
+The function supports both integer and text-based IDs. There are two overloaded versions:
+
+**Text-based IDs (primary function):**
 ```sql
 SELECT * FROM pgr_pcst_fast(
-    edges_sql text,             -- SQL query returning: id, source, target, cost
-    nodes_sql text,              -- SQL query returning: id, prize
-    root_id integer DEFAULT -1,  -- Root node ID (or -1 for auto-select)
+    edges_sql text,             -- SQL query returning: id, source, target, cost (id, source, target can be integer or text)
+    nodes_sql text,              -- SQL query returning: id, prize (id can be integer or text)
+    root_id text DEFAULT NULL,  -- Root node ID (text, or NULL for auto-select)
     num_clusters integer DEFAULT 1,  -- Number of clusters
     pruning text DEFAULT 'simple',   -- Pruning method: 'none', 'simple', 'gw', 'strong'
     verbosity integer DEFAULT 0      -- Verbosity level (0-3)
 );
 ```
 
+**Integer-based IDs (for backward compatibility):**
+```sql
+SELECT * FROM pgr_pcst_fast(
+    edges_sql text,             -- SQL query returning: id, source, target, cost
+    nodes_sql text,              -- SQL query returning: id, prize
+    root_id integer,             -- Root node ID (integer, use -1 for auto-select)
+    num_clusters integer DEFAULT 1,
+    pruning text DEFAULT 'simple',
+    verbosity integer DEFAULT 0
+);
+```
+
+**Note:** The `id`, `source`, and `target` columns in your SQL queries can be either `integer` or `text` type. The function automatically handles the conversion. Results are always returned as `text` (which can be cast back to integers if needed).
+
 #### Return Format
 
 Returns one row per selected edge in pg_routing format:
 - `seq` - Sequence number (1-based)
-- `edge` - Edge ID (bigint)
-- `source` - Source node ID (bigint)
-- `target` - Target node ID (bigint)
+- `edge` - Edge ID (text, can be cast to integer if needed)
+- `source` - Source node ID (text, can be cast to integer if needed)
+- `target` - Target node ID (text, can be cast to integer if needed)
 - `cost` - Edge cost (float8)
 
 #### Basic Example
@@ -156,14 +174,34 @@ INSERT INTO nodes (id, prize) VALUES
     (102, 15.0),
     (103, 40.0);
 
--- Run PCST algorithm
+-- Run PCST algorithm (using integer root_id for backward compatibility)
 SELECT * FROM pgr_pcst_fast(
     'SELECT id, source, target, cost FROM edges',
     'SELECT id, prize FROM nodes',
-    -1,      -- Auto-select root
+    -1,      -- Auto-select root (integer -1 is converted to NULL)
     1,       -- Single cluster
     'simple', -- Pruning method
     0        -- Verbosity
+);
+
+-- Or use the text-based version with NULL for auto-select
+SELECT * FROM pgr_pcst_fast(
+    'SELECT id, source, target, cost FROM edges',
+    'SELECT id, prize FROM nodes',
+    NULL,    -- Auto-select root (text version)
+    1,       -- Single cluster
+    'simple',
+    0
+);
+
+-- Or specify a specific root node
+SELECT * FROM pgr_pcst_fast(
+    'SELECT id, source, target, cost FROM edges',
+    'SELECT id, prize FROM nodes',
+    '100',   -- Root node ID as text
+    1,
+    'simple',
+    0
 );
 ```
 
@@ -174,6 +212,17 @@ SELECT * FROM pgr_pcst_fast(
    1 |    1 |    100 |    101 |  5.0
    2 |    2 |    101 |    102 |  8.0
    3 |    3 |    102 |    103 | 12.0
+```
+
+**Note:** The `edge`, `source`, and `target` columns are returned as `text`. If you need integers, cast them:
+```sql
+SELECT
+    seq,
+    edge::integer as edge_id,
+    source::integer as source_id,
+    target::integer as target_id,
+    cost
+FROM pgr_pcst_fast(...);
 ```
 
 #### Real-World Example with Filtering
@@ -188,7 +237,62 @@ SELECT * FROM pgr_pcst_fast(
     'SELECT id, prize
      FROM important_locations
      WHERE region_id = 5',
-    -1, 1, 'strong', 0
+    NULL, 1, 'strong', 0  -- NULL for auto-select root
+);
+```
+
+#### Text-Based IDs Example
+
+The function works seamlessly with text-based IDs (location codes, UUIDs, etc.):
+
+```sql
+-- Create tables with text IDs
+CREATE TEMP TABLE location_edges (
+    id text,
+    source text,
+    target text,
+    cost float8
+);
+
+CREATE TEMP TABLE location_nodes (
+    id text,
+    prize float8
+);
+
+INSERT INTO location_edges (id, source, target, cost) VALUES
+    ('E1', 'NYC', 'BOS', 5.0),
+    ('E2', 'BOS', 'PHL', 8.0),
+    ('E3', 'PHL', 'DC', 12.0),
+    ('E4', 'NYC', 'PHL', 20.0);
+
+INSERT INTO location_nodes (id, prize) VALUES
+    ('NYC', 50.0),
+    ('BOS', 10.0),
+    ('PHL', 15.0),
+    ('DC', 40.0);
+
+-- Run PCST with text IDs
+SELECT * FROM pgr_pcst_fast(
+    'SELECT id, source, target, cost FROM location_edges',
+    'SELECT id, prize FROM location_nodes',
+    'NYC',  -- Root node ID (text)
+    1,
+    'simple',
+    0
+);
+```
+
+#### Mixed Integer/Text IDs
+
+You can mix integer and text IDs - the function automatically converts everything to text internally:
+
+```sql
+-- Edges with integer IDs, nodes with text IDs
+SELECT * FROM pgr_pcst_fast(
+    'SELECT id::text, source::text, target::text, cost FROM edges',
+    'SELECT location_code as id, prize FROM nodes',
+    'NYC',  -- Text root ID
+    1, 'simple', 0
 );
 ```
 
@@ -202,7 +306,7 @@ SELECT * FROM pgr_pcst_fast(
 SELECT * FROM pgr_pcst_fast(
     'SELECT id, source, target, cost FROM edges',  -- Contains node 105
     'SELECT id, prize FROM nodes',                  -- Does NOT contain node 105
-    -1, 1, 'simple', 0
+    NULL, 1, 'simple', 0
 );
 -- Node 105 will have prize = 0.0
 ```
@@ -215,7 +319,7 @@ For debugging and understanding results, use `pgr_pcst_fast_with_viz()`:
 SELECT pgr_pcst_fast_with_viz(
     'SELECT id, source, target, cost FROM edges',
     'SELECT id, prize FROM nodes',
-    -1,      -- Auto-select root
+    NULL,    -- Auto-select root (or use text root ID)
     1,       -- Single cluster
     'simple', -- Pruning method
     0        -- Verbosity
@@ -254,13 +358,13 @@ SELECT * FROM pcst_fast(
 ```sql
 -- Compare different pruning methods
 SELECT 'No Pruning' as method, COUNT(*) as edges_selected
-FROM pgr_pcst_fast(edges_sql, nodes_sql, -1, 1, 'none', 0)
+FROM pgr_pcst_fast(edges_sql, nodes_sql, NULL, 1, 'none', 0)
 UNION ALL
 SELECT 'Simple Pruning', COUNT(*)
-FROM pgr_pcst_fast(edges_sql, nodes_sql, -1, 1, 'simple', 0)
+FROM pgr_pcst_fast(edges_sql, nodes_sql, NULL, 1, 'simple', 0)
 UNION ALL
 SELECT 'Strong Pruning', COUNT(*)
-FROM pgr_pcst_fast(edges_sql, nodes_sql, -1, 1, 'strong', 0);
+FROM pgr_pcst_fast(edges_sql, nodes_sql, NULL, 1, 'strong', 0);
 ```
 
 #### Root Node Analysis
@@ -268,23 +372,24 @@ FROM pgr_pcst_fast(edges_sql, nodes_sql, -1, 1, 'strong', 0);
 ```sql
 -- Test different root nodes
 SELECT 'Root=100' as test, COUNT(*) as edges_selected
-FROM pgr_pcst_fast(edges_sql, nodes_sql, 100, 1, 'simple', 0)
+FROM pgr_pcst_fast(edges_sql, nodes_sql, '100', 1, 'simple', 0)  -- Text root ID
 UNION ALL
 SELECT 'Auto Root', COUNT(*)
-FROM pgr_pcst_fast(edges_sql, nodes_sql, -1, 1, 'simple', 0);
+FROM pgr_pcst_fast(edges_sql, nodes_sql, NULL, 1, 'simple', 0);
 ```
 
 #### Joining Results with Original Data
 
 ```sql
 -- Get full edge details for selected edges
+-- Note: Cast edge ID to integer for joining if your edges table uses integer IDs
 SELECT e.*, r.seq, r.cost as selected_cost
 FROM pgr_pcst_fast(
     'SELECT id, source, target, cost FROM edges',
     'SELECT id, prize FROM nodes',
-    -1, 1, 'simple', 0
+    NULL, 1, 'simple', 0
 ) r
-JOIN edges e ON e.id = r.edge
+JOIN edges e ON e.id = r.edge::integer  -- Cast text to integer for join
 ORDER BY r.seq;
 ```
 
@@ -295,7 +400,7 @@ ORDER BY r.seq;
 SELECT * FROM pgr_pcst_fast(
     'SELECT id, source, target, cost FROM edges',
     'SELECT id, prize FROM nodes',
-    -1,      -- Auto-select root
+    NULL,    -- Auto-select root
     3,       -- Allow up to 3 clusters
     'simple',
     0
@@ -334,10 +439,10 @@ The extension uses efficient C++ implementations with:
 
 ```sql
 -- ❌ May fail
-SELECT * FROM pgr_pcst_fast(edges_sql, nodes_sql, 100, 1, 'gw', 0);
+SELECT * FROM pgr_pcst_fast(edges_sql, nodes_sql, '100', 1, 'gw', 0);
 
 -- ✅ Works reliably
-SELECT * FROM pgr_pcst_fast(edges_sql, nodes_sql, 100, 1, 'simple', 0);
+SELECT * FROM pgr_pcst_fast(edges_sql, nodes_sql, '100', 1, 'simple', 0);
 ```
 
 ### Docker Troubleshooting
