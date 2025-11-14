@@ -23,7 +23,7 @@ Docker is provided for quick testing and getting familiar with the extension. **
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pg_pcst_fast.git
+git clone https://github.com/frugardc/pg_pcst_fast.git
 cd pg_pcst_fast
 
 # Build and run with Docker Compose
@@ -64,7 +64,7 @@ For production installations on your own PostgreSQL server:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pg_pcst_fast.git
+git clone https://github.com/frugardc/pg_pcst_fast.git
 cd pg_pcst_fast
 
 # Build the extension
@@ -368,3 +368,4 @@ This project maintains the same MIT license as the original pcst_fast implementa
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
+
