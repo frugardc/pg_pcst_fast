@@ -35,6 +35,9 @@ EXPOSE 5432
 # Clean up build files but keep the extension installed
 RUN cd / && rm -rf /tmp/pg_pcst_fast
 
+# Add SQL script to be executed when the database starts
+COPY test_data/z_connectors_for_test.sql /docker-entrypoint-initdb.d/
+
 # Add a health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD pg_isready -U postgres -d testdb || exit 1

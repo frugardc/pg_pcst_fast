@@ -451,6 +451,14 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
             // Process nodes and set prizes
             // Note: nodes that appear in edges but not in nodes query will have prize 0
             Oid node_id_type = SPI_gettypeid(nodes_tupdesc, 1);
+
+            if (verbosity > 0) {
+                elog(INFO, "pgr_pcst_fast: Processing %lu nodes from nodes query", SPI_processed);
+            }
+
+            int nodes_matched = 0;
+            int nodes_not_found = 0;
+
             for (unsigned long i = 0; i < SPI_processed; i++) {
                 HeapTuple tuple = SPI_tuptable->vals[i];
                 bool isnull;
@@ -463,16 +471,67 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                 text *node_id_text = datum_to_text(node_id_datum, node_id_type);
                 double prize = DatumGetFloat8(prize_datum);
 
+                // Debug: log the node ID we're looking for (first few only)
+                if (verbosity > 0 && i < 5) {
+                    char *node_id_str = text_to_cstring(node_id_text);
+                    elog(INFO, "pgr_pcst_fast: Looking up node_id='%s' (len=%d, prize=%.2f)",
+                         node_id_str, VARSIZE(node_id_text) - VARHDRSZ, prize);
+                    pfree(node_id_str);
+                }
+
                 // Find node index using hash table
-                bool found;
-                node_map_entry *entry = (node_map_entry *) hash_search(node_map, &node_id_text, HASH_FIND, &found);
+                // Try hash_search first, but if it fails, fall back to manual iteration
+                bool found = false;
+                node_map_entry *entry = NULL;
+
+                // First try: use hash_search with the text pointer
+                text *node_id_key = node_id_text;
+                entry = (node_map_entry *) hash_search(node_map, &node_id_key, HASH_FIND, &found);
+
+                // Fallback: if hash_search fails, manually iterate through hash table
+                // This is slower but more reliable if there's a hash function issue
+                if (!found || entry == NULL) {
+                    HASH_SEQ_STATUS hash_seq;
+                    node_map_entry *hentry;
+
+                    hash_seq_init(&hash_seq, node_map);
+                    while ((hentry = (node_map_entry *) hash_seq_search(&hash_seq)) != NULL) {
+                        if (hentry->node_id != NULL && text_cmp(hentry->node_id, node_id_text) == 0) {
+                            entry = hentry;
+                            found = true;
+                            break;
+                        }
+                    }
+                    hash_seq_term(&hash_seq);
+                }
+
+                // Debug: log lookup result (first few only)
+                if (verbosity > 0 && i < 5) {
+                    char *node_id_str = text_to_cstring(node_id_text);
+                    if (found && entry) {
+                        char *stored_id_str = text_to_cstring(entry->node_id);
+                        elog(INFO, "pgr_pcst_fast: Hash lookup FOUND: looking_for='%s', stored='%s', index=%d",
+                             node_id_str, stored_id_str, entry->index);
+                        pfree(stored_id_str);
+                    } else {
+                        elog(INFO, "pgr_pcst_fast: Hash lookup NOT FOUND: node_id='%s'", node_id_str);
+                    }
+                    pfree(node_id_str);
+                }
 
                 if (found && entry != NULL) {
                     int node_index = entry->index;
                     if (node_index >= 0 && node_index < num_nodes) {
                         node_prizes[node_index] = prize;
+                        nodes_matched++;
+                        if (verbosity > 0 && i < 10) {  // Only log first 10 for large datasets
+                            char *node_id_str = text_to_cstring(node_id_text);
+                            elog(INFO, "pgr_pcst_fast: Setting prize for node_id=%s (index=%d) to %.2f",
+                                 node_id_str, node_index, prize);
+                            pfree(node_id_str);
+                        }
                     } else {
-                        if (verbosity > 1) {
+                        if (verbosity > 0) {
                             char *node_id_str = text_to_cstring(node_id_text);
                             elog(WARNING, "pgr_pcst_fast: node_id=%s mapped to invalid index %d (num_nodes=%d)",
                                  node_id_str, node_index, num_nodes);
@@ -481,22 +540,84 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                     }
                 } else {
                     // Node in nodes query but not in edges - this is OK, just skip it
-                    if (verbosity > 1) {
+                    nodes_not_found++;
+                    if (verbosity > 0 && i < 10) {  // Only log first 10 for large datasets
                         char *node_id_str = text_to_cstring(node_id_text);
-                        elog(INFO, "pgr_pcst_fast: node_id=%s in nodes query but not in edges, skipping", node_id_str);
+                        elog(INFO, "pgr_pcst_fast: node_id=%s in nodes query but not in edges, skipping (prize=%.2f)",
+                             node_id_str, prize);
                         pfree(node_id_str);
                     }
                 }
+
+                // Free the temporary node_id_text (it was created by datum_to_text)
+                pfree(node_id_text);
             }
 
-            // Debug: Log all node prizes after setting them
+            // Summary of node matching
+            if (verbosity > 0) {
+                elog(INFO, "pgr_pcst_fast: Nodes query summary: %lu rows processed, %d matched, %d not found in edges",
+                     SPI_processed, nodes_matched, nodes_not_found);
+            }
+
+            // Debug: Log node prizes with better visibility
             if (verbosity > 0) {
                 elog(INFO, "pgr_pcst_fast: Total nodes processed: %d", num_nodes);
-                for (int i = 0; i < num_nodes && i < 20; i++) {
+
+                // Count nodes with prizes > 0
+                int nodes_with_prizes = 0;
+                double total_prize_sum = 0.0;
+                double max_prize = 0.0;
+                int max_prize_index = -1;
+
+                for (int i = 0; i < num_nodes; i++) {
+                    if (node_prizes[i] > 0.0) {
+                        nodes_with_prizes++;
+                        total_prize_sum += node_prizes[i];
+                        if (node_prizes[i] > max_prize) {
+                            max_prize = node_prizes[i];
+                            max_prize_index = i;
+                        }
+                    }
+                }
+
+                elog(INFO, "pgr_pcst_fast: Prize statistics: %d nodes with prizes > 0, total prize sum=%.2f, max prize=%.2f",
+                     nodes_with_prizes, total_prize_sum, max_prize);
+
+                // Show first 10 nodes (always)
+                elog(INFO, "pgr_pcst_fast: First 10 nodes:");
+                for (int i = 0; i < num_nodes && i < 10; i++) {
                     char *node_id_str = text_to_cstring(index_to_node_id[i]);
-                    elog(INFO, "pgr_pcst_fast: After processing nodes, node[%d] (id=%s) prize=%.2f",
+                    elog(INFO, "pgr_pcst_fast:   node[%d] (id=%s) prize=%.2f",
                          i, node_id_str, node_prizes[i]);
                     pfree(node_id_str);
+                }
+
+                // Show nodes with prizes > 0 (up to 20)
+                if (nodes_with_prizes > 0) {
+                    elog(INFO, "pgr_pcst_fast: Nodes with prizes > 0 (showing up to 20):");
+                    int shown = 0;
+                    for (int i = 0; i < num_nodes && shown < 20; i++) {
+                        if (node_prizes[i] > 0.0) {
+                            char *node_id_str = text_to_cstring(index_to_node_id[i]);
+                            elog(INFO, "pgr_pcst_fast:   node[%d] (id=%s) prize=%.2f",
+                                 i, node_id_str, node_prizes[i]);
+                            pfree(node_id_str);
+                            shown++;
+                        }
+                    }
+                    if (nodes_with_prizes > 20) {
+                        elog(INFO, "pgr_pcst_fast:   ... and %d more nodes with prizes > 0", nodes_with_prizes - 20);
+                    }
+                } else {
+                    elog(WARNING, "pgr_pcst_fast: WARNING - No nodes have prizes > 0! All prizes are 0.00");
+                }
+
+                // Show the node with maximum prize
+                if (max_prize_index >= 0) {
+                    char *max_prize_id_str = text_to_cstring(index_to_node_id[max_prize_index]);
+                    elog(INFO, "pgr_pcst_fast: Node with maximum prize: node[%d] (id=%s) prize=%.2f",
+                         max_prize_index, max_prize_id_str, max_prize);
+                    pfree(max_prize_id_str);
                 }
             }
         } else {
@@ -545,17 +666,35 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
         else
             pruning_method = 1; // default to simple
 
-        // Debug: Verify node prizes are set correctly
-        // (This can be removed after debugging)
+        // Debug: Verify node prizes and edges
         if (verbosity > 0) {
             elog(INFO, "pgr_pcst_fast: num_nodes=%d, num_edges=%d, root_index=%d",
                  num_nodes, num_edges, root_index);
+
+            // Show first 10 nodes
+            elog(INFO, "pgr_pcst_fast: First 10 nodes:");
             for (int i = 0; i < num_nodes && i < 10; i++) {
                 char *node_id_str = text_to_cstring(index_to_node_id[i]);
                 elog(INFO, "  node[%d] (id=%s) prize=%.2f",
                      i, node_id_str, node_prizes[i]);
                 pfree(node_id_str);
             }
+
+            // Show edge statistics
+            double total_edge_cost = 0.0;
+            double min_edge_cost = (num_edges > 0) ? edge_costs[0] : 0.0;
+            double max_edge_cost = (num_edges > 0) ? edge_costs[0] : 0.0;
+            for (int i = 0; i < num_edges; i++) {
+                total_edge_cost += edge_costs[i];
+                if (edge_costs[i] < min_edge_cost) min_edge_cost = edge_costs[i];
+                if (edge_costs[i] > max_edge_cost) max_edge_cost = edge_costs[i];
+            }
+            elog(INFO, "pgr_pcst_fast: Edge statistics: total=%d edges, total cost=%.2f, min=%.2f, max=%.2f, avg=%.2f",
+                 num_edges, total_edge_cost, min_edge_cost, max_edge_cost,
+                 num_edges > 0 ? total_edge_cost / num_edges : 0.0);
+
+            // Show first 10 edges
+            elog(INFO, "pgr_pcst_fast: First 10 edges:");
             for (int i = 0; i < num_edges && i < 10; i++) {
                 char *edge_id_str = text_to_cstring(edge_ids[i]);
                 char *source_id_str = text_to_cstring(index_to_node_id[edge_sources[i]]);
@@ -566,12 +705,30 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                 pfree(source_id_str);
                 pfree(target_id_str);
             }
+
+            // Show last 5 edges (if there are more than 10)
+            if (num_edges > 10) {
+                elog(INFO, "pgr_pcst_fast: Last 5 edges:");
+                int start = (num_edges > 5) ? num_edges - 5 : 10;
+                for (int i = start; i < num_edges; i++) {
+                    char *edge_id_str = text_to_cstring(edge_ids[i]);
+                    char *source_id_str = text_to_cstring(index_to_node_id[edge_sources[i]]);
+                    char *target_id_str = text_to_cstring(index_to_node_id[edge_targets[i]]);
+                    elog(INFO, "  edge[%d] (id=%s): %s->%s cost=%.2f",
+                         i, edge_id_str, source_id_str, target_id_str, edge_costs[i]);
+                    pfree(edge_id_str);
+                    pfree(source_id_str);
+                    pfree(target_id_str);
+                }
+            }
         }
 
         // PRESERVE the original edge_costs BEFORE calling the algorithm
         // The algorithm may modify the costs array in place, even if we pass a copy
         // So we need to save the original values first
+        MemoryContext ec_oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
         double *edge_costs_original = (double *) palloc(num_edges * sizeof(double));
+        MemoryContextSwitchTo(ec_oldctx);
         memcpy(edge_costs_original, edge_costs, num_edges * sizeof(double));
 
         // Make a copy of edge_costs for the algorithm to modify
@@ -598,17 +755,31 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
 
         // Store original edge source/target IDs for result rows
         // Map internal indices back to original node IDs (text)
+        /* Ensure all long-lived data is copied into the multi-call context */
+        MemoryContext data_mctx_prev = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        text **node_id_copies = (text **) palloc(num_nodes * sizeof(text *));
+        for (int i = 0; i < num_nodes; i++) {
+            if (index_to_node_id[i] != NULL && VARSIZE(index_to_node_id[i]) >= VARHDRSZ) {
+                int len = VARSIZE(index_to_node_id[i]);
+                node_id_copies[i] = (text *) palloc(len);
+                memcpy(node_id_copies[i], index_to_node_id[i], len);
+            } else {
+                node_id_copies[i] = NULL;
+            }
+        }
+
         text **original_edge_sources = (text **) palloc(num_edges * sizeof(text *));
         text **original_edge_targets = (text **) palloc(num_edges * sizeof(text *));
 
         for (int i = 0; i < num_edges; i++) {
             if (edge_sources[i] >= 0 && edge_sources[i] < num_nodes) {
-                original_edge_sources[i] = index_to_node_id[edge_sources[i]];
+                original_edge_sources[i] = node_id_copies[edge_sources[i]];
             } else {
                 original_edge_sources[i] = NULL;
             }
             if (edge_targets[i] >= 0 && edge_targets[i] < num_nodes) {
-                original_edge_targets[i] = index_to_node_id[edge_targets[i]];
+                original_edge_targets[i] = node_id_copies[edge_targets[i]];
             } else {
                 original_edge_targets[i] = NULL;
             }
@@ -638,7 +809,7 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
         pgr_data->result = result;
         pgr_data->num_nodes = num_nodes;
         pgr_data->num_edges = num_edges;
-        pgr_data->index_to_node_id = index_to_node_id;
+        pgr_data->index_to_node_id = node_id_copies;
         pgr_data->index_to_edge_id = edge_ids_copy;  // Use the deep copy
         pgr_data->edge_sources = original_edge_sources;
         pgr_data->edge_targets = original_edge_targets;
@@ -648,11 +819,14 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
 
         // Debug: Verify edge_costs and edge_ids arrays before storing
         if (verbosity > 0) {
-            elog(INFO, "pgr_pcst_fast: Storing edge_costs_original array (num_edges=%d):", num_edges);
+            elog(INFO, "pgr_pcst_fast: Storing edge_costs_original array (num_edges=%d, showing first 10):", num_edges);
             for (int i = 0; i < num_edges && i < 10; i++) {
                 elog(INFO, "  edge_costs_original[%d] = %.2f", i, edge_costs_original[i]);
             }
-            elog(INFO, "pgr_pcst_fast: Storing edge_ids_copy array (num_edges=%d):", num_edges);
+            if (num_edges > 10) {
+                elog(INFO, "  ... and %d more edges", num_edges - 10);
+            }
+            elog(INFO, "pgr_pcst_fast: Storing edge_ids_copy array (num_edges=%d, showing first 10):", num_edges);
             for (int i = 0; i < num_edges && i < 10; i++) {
                 if (edge_ids_copy[i] != NULL) {
                     char *edge_id_str = text_to_cstring(edge_ids_copy[i]);
@@ -663,6 +837,9 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                     elog(INFO, "  edge_ids_copy[%d] = NULL", i);
                 }
             }
+            if (num_edges > 10) {
+                elog(INFO, "  ... and %d more edge IDs", num_edges - 10);
+            }
             elog(INFO, "pgr_pcst_fast: Result contains %d edges:", result->num_edges);
             for (int i = 0; i < result->num_edges && i < 10; i++) {
                 elog(INFO, "  result_edges[%d] = %d", i, result->result_edges[i]);
@@ -671,6 +848,8 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
 
         funcctx->user_fctx = pgr_data;
         funcctx->max_calls = result->num_edges;  // Return one row per selected edge
+
+        MemoryContextSwitchTo(data_mctx_prev);
 
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
