@@ -109,7 +109,7 @@ Datum pcst_fast_pg(PG_FUNCTION_ARGS) {
         else
             pruning_method = 2; // default to GW
 
-        // Call the C function
+        // Call the C function (prizes/costs are in arrays indexed by internal node/edge indices)
         pcst_result_t *result = pcst_solve(
             edge_sources, edge_targets, costs_data, num_edges,
             prizes_data, num_nodes,
@@ -483,6 +483,11 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                 // Try hash_search first, but if it fails, fall back to manual iteration
                 bool found = false;
                 node_map_entry *entry = NULL;
+                bool hash_seq_initialized = false;
+                HASH_SEQ_STATUS hash_seq;
+
+                // Initialize hash_seq to avoid uninitialized variable issues
+                MemSet(&hash_seq, 0, sizeof(HASH_SEQ_STATUS));
 
                 // First try: use hash_search with the text pointer
                 text *node_id_key = node_id_text;
@@ -490,18 +495,36 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
 
                 // Fallback: if hash_search fails, manually iterate through hash table
                 // This is slower but more reliable if there's a hash function issue
+                // Use PG_TRY/PG_CATCH to ensure we always terminate the sequence scan
                 if (!found || entry == NULL) {
-                    HASH_SEQ_STATUS hash_seq;
-                    node_map_entry *hentry;
+                    PG_TRY();
+                    {
+                        node_map_entry *hentry;
 
-                    hash_seq_init(&hash_seq, node_map);
-                    while ((hentry = (node_map_entry *) hash_seq_search(&hash_seq)) != NULL) {
-                        if (hentry->node_id != NULL && text_cmp(hentry->node_id, node_id_text) == 0) {
-                            entry = hentry;
-                            found = true;
-                            break;
+                        hash_seq_init(&hash_seq, node_map);
+                        hash_seq_initialized = true;
+                        while ((hentry = (node_map_entry *) hash_seq_search(&hash_seq)) != NULL) {
+                            if (hentry->node_id != NULL && text_cmp(hentry->node_id, node_id_text) == 0) {
+                                entry = hentry;
+                                found = true;
+                                break;
+                            }
                         }
                     }
+                    PG_CATCH();
+                    {
+                        // Always terminate hash sequence scan if we initialized it, even on error
+                        if (hash_seq_initialized) {
+                            hash_seq_term(&hash_seq);
+                            hash_seq_initialized = false;
+                        }
+                        PG_RE_THROW();
+                    }
+                    PG_END_TRY();
+                }
+
+                // Always terminate hash sequence scan if we initialized it
+                if (hash_seq_initialized) {
                     hash_seq_term(&hash_seq);
                 }
 
@@ -539,14 +562,22 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                         }
                     }
                 } else {
-                    // Node in nodes query but not in edges - this is OK, just skip it
+                    // Node in nodes query but not in edges
                     nodes_not_found++;
-                    if (verbosity > 0 && i < 10) {  // Only log first 10 for large datasets
-                        char *node_id_str = text_to_cstring(node_id_text);
-                        elog(INFO, "pgr_pcst_fast: node_id=%s in nodes query but not in edges, skipping (prize=%.2f)",
-                             node_id_str, prize);
-                        pfree(node_id_str);
+                    char *node_id_str = text_to_cstring(node_id_text);
+
+                    // Collect missing node IDs for error reporting
+                    // Store up to 10 missing node IDs to avoid excessive memory usage
+                    if (nodes_not_found <= 10) {
+                        // We'll report these at the end
+                        if (verbosity > 0) {
+                            elog(WARNING, "pgr_pcst_fast: Prize node '%s' (prize=%.2f) not found in edges query - will be skipped",
+                                 node_id_str, prize);
+                        }
+                    } else if (nodes_not_found == 11) {
+                        elog(WARNING, "pgr_pcst_fast: Additional prize nodes not found in edges (suppressing further warnings)");
                     }
+                    pfree(node_id_str);
                 }
 
                 // Free the temporary node_id_text (it was created by datum_to_text)
@@ -554,9 +585,13 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
             }
 
             // Summary of node matching
-            if (verbosity > 0) {
+            if (verbosity > 0 || nodes_not_found > 0) {
                 elog(INFO, "pgr_pcst_fast: Nodes query summary: %lu rows processed, %d matched, %d not found in edges",
                      SPI_processed, nodes_matched, nodes_not_found);
+                if (nodes_not_found > 0) {
+                    elog(WARNING, "pgr_pcst_fast: %d prize node(s) from nodes query were not found in edges query and will be ignored",
+                         nodes_not_found);
+                }
             }
 
             // Debug: Log node prizes with better visibility
@@ -636,8 +671,52 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                 pfree(root_id_str);
                 root_index = -1;  // Auto-select
             } else {
-                bool found;
-                node_map_entry *entry = (node_map_entry *) hash_search(node_map, &root_id, HASH_FIND, &found);
+                bool found = false;
+                node_map_entry *entry = NULL;
+                bool hash_seq_initialized = false;
+                HASH_SEQ_STATUS hash_seq;
+
+                // Initialize hash_seq to avoid uninitialized variable issues
+                MemSet(&hash_seq, 0, sizeof(HASH_SEQ_STATUS));
+
+                // First try: use hash_search with the text pointer
+                text *root_id_key = root_id;
+                entry = (node_map_entry *) hash_search(node_map, &root_id_key, HASH_FIND, &found);
+
+                // Fallback: if hash_search fails, manually iterate through hash table
+                // This is slower but more reliable if there's a hash function issue
+                // Use PG_TRY/PG_CATCH to ensure we always terminate the sequence scan
+                if (!found || entry == NULL) {
+                    PG_TRY();
+                    {
+                        node_map_entry *hentry;
+
+                        hash_seq_init(&hash_seq, node_map);
+                        hash_seq_initialized = true;
+                        while ((hentry = (node_map_entry *) hash_seq_search(&hash_seq)) != NULL) {
+                            if (hentry->node_id != NULL && text_cmp(hentry->node_id, root_id) == 0) {
+                                entry = hentry;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    PG_CATCH();
+                    {
+                        // Always terminate hash sequence scan if we initialized it, even on error
+                        if (hash_seq_initialized) {
+                            hash_seq_term(&hash_seq);
+                            hash_seq_initialized = false;
+                        }
+                        PG_RE_THROW();
+                    }
+                    PG_END_TRY();
+                }
+
+                // Always terminate hash sequence scan if we initialized it
+                if (hash_seq_initialized) {
+                    hash_seq_term(&hash_seq);
+                }
 
                 if (!found || entry == NULL) {
                     ereport(ERROR,
@@ -645,6 +724,19 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                              errmsg("root node ID '%s' not found in edges", root_id_str)));
                 }
                 root_index = entry->index;
+
+                // Validate root_index is in valid range (should always be true if node is in hash table)
+                if (root_index < 0 || root_index >= num_nodes) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("root node ID '%s' maps to invalid index %d (valid range: 0-%d)",
+                                    root_id_str, root_index, num_nodes - 1)));
+                }
+
+                // Always log root node mapping for debugging (even if verbosity=0 when root is specified)
+                elog(INFO, "pgr_pcst_fast: Root node ID '%s' mapped to index %d (num_nodes=%d)",
+                     root_id_str, root_index, num_nodes);
+
                 pfree(root_id_str);
             }
         }
@@ -693,14 +785,14 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                  num_edges, total_edge_cost, min_edge_cost, max_edge_cost,
                  num_edges > 0 ? total_edge_cost / num_edges : 0.0);
 
-            // Show first 10 edges
-            elog(INFO, "pgr_pcst_fast: First 10 edges:");
+            // Show first 10 edges (with internal indices)
+            elog(INFO, "pgr_pcst_fast: First 10 edges (showing internal indices):");
             for (int i = 0; i < num_edges && i < 10; i++) {
                 char *edge_id_str = text_to_cstring(edge_ids[i]);
                 char *source_id_str = text_to_cstring(index_to_node_id[edge_sources[i]]);
                 char *target_id_str = text_to_cstring(index_to_node_id[edge_targets[i]]);
-                elog(INFO, "  edge[%d] (id=%s): %s->%s cost=%.2f",
-                     i, edge_id_str, source_id_str, target_id_str, edge_costs[i]);
+                elog(INFO, "  edge[%d] (id=%s): %s[%d]->%s[%d] cost=%.2f",
+                     i, edge_id_str, source_id_str, edge_sources[i], target_id_str, edge_targets[i], edge_costs[i]);
                 pfree(edge_id_str);
                 pfree(source_id_str);
                 pfree(target_id_str);
@@ -735,15 +827,63 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
         double *edge_costs_copy = (double *) palloc(num_edges * sizeof(double));
         memcpy(edge_costs_copy, edge_costs, num_edges * sizeof(double));
 
+        // When root is specified, algorithm requires num_clusters to be 0
+        // (see pcst_fast.cc line 304: "target_num_active_clusters must be 0 in the rooted case")
+        int effective_num_clusters = (root_index >= 0) ? 0 : num_clusters;
+
+        // Debug: Log parameters before calling algorithm (always log when root is specified)
+        if (root_index >= 0 || verbosity > 0) {
+            if (root_index >= 0 && num_clusters != 0) {
+                elog(INFO, "pgr_pcst_fast: Root node specified - setting num_clusters from %d to 0 (required by algorithm)",
+                     num_clusters);
+            }
+            elog(INFO, "pgr_pcst_fast: Calling pcst_solve with: num_edges=%d, num_nodes=%d, root_index=%d, num_clusters=%d (effective=%d), pruning_method=%d",
+                 num_edges, num_nodes, root_index, num_clusters, effective_num_clusters, pruning_method);
+
+            // Verify root_index is valid if specified
+            if (root_index >= 0) {
+                bool root_found_in_edges = false;
+                for (int i = 0; i < num_edges; i++) {
+                    if (edge_sources[i] == root_index || edge_targets[i] == root_index) {
+                        root_found_in_edges = true;
+                        break;
+                    }
+                }
+                elog(INFO, "pgr_pcst_fast: Root index %d validation: in_range=%s, in_edges=%s",
+                     root_index,
+                     (root_index >= 0 && root_index < num_nodes) ? "YES" : "NO",
+                     root_found_in_edges ? "YES" : "NO");
+            }
+        }
+
+        if (root_index >= 0 && num_clusters != 0 && verbosity > 0) {
+            elog(INFO, "pgr_pcst_fast: Root node specified - setting num_clusters from %d to 0 (required by algorithm)",
+                 num_clusters);
+        }
+
         // Call the C function (may modify the costs array)
         pcst_result_t *result = pcst_solve(
             edge_sources, edge_targets, edge_costs_copy, num_edges,
             node_prizes, num_nodes,
-            root_index, num_clusters, pruning_method, verbosity
+            root_index, effective_num_clusters, pruning_method, verbosity
         );
 
         // Free the copy after algorithm completes
         pfree(edge_costs_copy);
+
+        // Debug: Log algorithm result
+        if (verbosity > 0 && result) {
+            elog(INFO, "pgr_pcst_fast: Algorithm returned: success=%d, num_nodes=%d, num_edges=%d",
+                 result->success, result->num_nodes, result->num_edges);
+            if (result->num_edges > 0) {
+                elog(INFO, "pgr_pcst_fast: Selected edge indices (first 10):");
+                for (int i = 0; i < result->num_edges && i < 10; i++) {
+                    elog(INFO, "  result_edges[%d] = %d", i, result->result_edges[i]);
+                }
+            } else if (result->success) {
+                elog(WARNING, "pgr_pcst_fast: Algorithm succeeded but returned 0 edges - this may indicate no profitable solution exists");
+            }
+        }
 
         if (!result || !result->success) {
             const char *error_msg = result ? result->error_message : "Unknown error";

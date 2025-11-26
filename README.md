@@ -367,6 +367,26 @@ SELECT 'Strong Pruning', COUNT(*)
 FROM pgr_pcst_fast(edges_sql, nodes_sql, NULL, 1, 'strong', 0);
 ```
 
+#### Rooted vs Unrooted Behavior
+
+The underlying PCST algorithm behaves differently depending on whether a **root** is specified:
+
+- **Unrooted case** (`root_id IS NULL` or `root_id = '-1'` / `-1`):
+  - The objective is to maximize \( \text{total prizes} - \text{total edge costs} \) over any forest.
+  - The algorithm is allowed to return **zero edges** and just pick one or more prize nodes if that gives the best objective (or even pick nothing if all prizes are too small relative to costs).
+  - Example: with a single high‑prize node and expensive edges, the optimal solution can be that node alone with no edges.
+
+- **Rooted case** (`root_id` set to a valid node):
+  - The C++ library requires `target_num_active_clusters = 0` when a root is specified.
+  - The PostgreSQL wrapper automatically enforces this by internally passing `num_clusters = 0` to the algorithm whenever a root is specified, regardless of the user‑supplied `num_clusters`.
+  - This effectively asks for a **single rooted structure** (tree) connected to the specified root; you still control pruning via the `pruning` parameter.
+
+**Practical guidelines:**
+
+- If you want a **connected rooted tree**, always pass a valid `root_id` (text or integer); the extension will handle the internal cluster setting.
+- If you want the algorithm to freely choose the best subset (possibly disconnected, or just isolated prize nodes), pass `root_id = NULL` (or `-1` in the integer overload) and control the maximum number of allowed clusters via `num_clusters`.
+- Seeing **0 edges** in the unrooted case is not necessarily a bug – it usually means that no connected structure improves \( \text{prizes} - \text{costs} \) compared to taking isolated prize nodes (or nothing).
+
 #### Root Node Analysis
 
 ```sql

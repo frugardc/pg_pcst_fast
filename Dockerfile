@@ -3,6 +3,7 @@ FROM postgis/postgis:18-3.6
 # Install build dependencies for PostgreSQL extensions
 RUN apt-get update && apt-get install -y \
     postgresql-server-dev-18 \
+    postgresql-18-pgtap \
     build-essential \
     make \
     gcc \

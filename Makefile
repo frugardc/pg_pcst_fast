@@ -51,3 +51,28 @@ src/pcst_fast_c_wrapper.bc: src/pcst_fast_c_wrapper.cpp
 
 src/pcst_fast.bc: src/pcst_fast.cc
 	$(CLANG) -xc++ $(BITCODE_CXXFLAGS) $(CPPFLAGS) -fPIC -I$(shell $(PG_CONFIG) --includedir-server) -flto=thin -emit-llvm -c -o $@ $<
+
+# pgTAP testing support
+# Set these variables to configure test database connection
+PGTAP_DB ?= $(shell echo $$PGDATABASE || echo postgres)
+PGTAP_USER ?= $(shell echo $$PGUSER || echo postgres)
+PGTAP_HOST ?= $(shell echo $$PGHOST || echo localhost)
+PGTAP_PORT ?= $(shell echo $$PGPORT || echo 5432)
+
+# Test targets
+.PHONY: test test-install test-check
+
+# Install pgTAP extension (if not already installed)
+test-install:
+	@echo "Checking for pgTAP extension..."
+	@psql -h $(PGTAP_HOST) -p $(PGTAP_PORT) -U $(PGTAP_USER) -d $(PGTAP_DB) -c "CREATE EXTENSION IF NOT EXISTS pgtap;" || \
+	 (echo "ERROR: Could not install pgTAP. Please install it first:" && \
+	  echo "  CREATE EXTENSION pgtap;" && exit 1)
+
+# Run pgTAP tests
+test-check: test-install
+	@echo "Running pgTAP tests..."
+	@psql -h $(PGTAP_HOST) -p $(PGTAP_PORT) -U $(PGTAP_USER) -d $(PGTAP_DB) -f test/pgtap/pgr_pcst_fast.sql
+
+# Alias for test-check
+test: test-check

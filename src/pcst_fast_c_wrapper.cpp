@@ -2,6 +2,7 @@
 #include "pcst_fast.h"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <vector>
 #include <utility>
 
@@ -11,9 +12,13 @@ using std::pair;
 using std::make_pair;
 
 // Simple output function for C wrapper
+// Note: This is called from C++ code, so we can't use PostgreSQL's elog directly
+// Instead, we'll use fprintf to stderr, which PostgreSQL will capture if log_statement is set
 static void default_output_function(const char* message) {
-    // For PostgreSQL extension, we might want to use elog here
-    // For now, just ignore output to avoid issues
+    // Output to stderr - PostgreSQL will capture this if client_min_messages is set appropriately
+    // This allows algorithm verbosity output to be seen
+    fprintf(stderr, "%s", message);
+    fflush(stderr);
 }
 
 extern "C" {
@@ -34,7 +39,7 @@ pcst_result_t* pcst_solve(
     if (!result) {
         return nullptr;
     }
-    
+
     // Initialize result
     result->result_nodes = nullptr;
     result->result_edges = nullptr;
@@ -42,17 +47,17 @@ pcst_result_t* pcst_solve(
     result->num_edges = 0;
     result->success = 0;
     strcpy(result->error_message, "");
-    
+
     try {
         // Validate root node if specified
         if (root_node >= 0) {
             if (root_node >= num_nodes) {
-                snprintf(result->error_message, sizeof(result->error_message), 
-                        "Root node %d is out of range. Valid range is 0-%d", 
+                snprintf(result->error_message, sizeof(result->error_message),
+                        "Root node %d is out of range. Valid range is 0-%d",
                         root_node, num_nodes - 1);
                 return result;
             }
-            
+
             // Check if root node appears in any edge (connectivity check)
             bool root_connected = false;
             for (int i = 0; i < num_edges; i++) {
@@ -61,47 +66,47 @@ pcst_result_t* pcst_solve(
                     break;
                 }
             }
-            
+
             if (!root_connected) {
-                snprintf(result->error_message, sizeof(result->error_message), 
+                snprintf(result->error_message, sizeof(result->error_message),
                         "Root node %d is not connected to any edges", root_node);
                 return result;
             }
         }
-        
+
         // Convert input data to C++ format
         vector<pair<int, int>> edges;
         vector<double> prizes;
         vector<double> costs;
-        
+
         // Build edges vector and validate node IDs
         int max_node_id = -1;
         for (int i = 0; i < num_edges; i++) {
             if (edge_sources[i] < 0 || edge_targets[i] < 0) {
-                snprintf(result->error_message, sizeof(result->error_message), 
-                        "Edge %d has negative node ID: source=%d, target=%d", 
+                snprintf(result->error_message, sizeof(result->error_message),
+                        "Edge %d has negative node ID: source=%d, target=%d",
                         i, edge_sources[i], edge_targets[i]);
                 return result;
             }
-            
+
             max_node_id = std::max(max_node_id, std::max(edge_sources[i], edge_targets[i]));
             edges.push_back(make_pair(edge_sources[i], edge_targets[i]));
             costs.push_back(edge_costs[i]);
         }
-        
+
         // Validate that all edge node IDs have corresponding prizes
         if (max_node_id >= num_nodes) {
-            snprintf(result->error_message, sizeof(result->error_message), 
-                    "Edge references node %d but only %d prizes provided (valid range: 0-%d)", 
+            snprintf(result->error_message, sizeof(result->error_message),
+                    "Edge references node %d but only %d prizes provided (valid range: 0-%d)",
                     max_node_id, num_nodes, num_nodes - 1);
             return result;
         }
-        
+
         // Build prizes vector
         for (int i = 0; i < num_nodes; i++) {
             prizes.push_back(node_prizes[i]);
         }
-        
+
         // Convert pruning method
         PCSTFast::PruningMethod pruning = PCSTFast::kGWPruning;
         switch (pruning_method) {
@@ -111,37 +116,70 @@ pcst_result_t* pcst_solve(
             case 3: pruning = PCSTFast::kStrongPruning; break;
             default: pruning = PCSTFast::kGWPruning; break;
         }
-        
+
         // Handle root node (-1 means no root in C++ API)
         int cpp_root = (root_node < 0) ? PCSTFast::kNoRoot : root_node;
-        
+
+        // Debug: Log the data being passed to the algorithm
+        if (verbosity_level > 0) {
+            fprintf(stderr, "PCST Algorithm Input:\n");
+            fprintf(stderr, "  num_nodes=%d, num_edges=%d, root=%d, clusters=%d\n",
+                    num_nodes, num_edges, cpp_root, target_num_active_clusters);
+            fprintf(stderr, "  Prizes: ");
+            for (int i = 0; i < num_nodes && i < 10; i++) {
+                fprintf(stderr, "node[%d]=%.2f ", i, prizes[i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  Edges: ");
+            for (int i = 0; i < num_edges && i < 10; i++) {
+                fprintf(stderr, "edge[%d]: %d->%d cost=%.2f ",
+                        i, edges[i].first, edges[i].second, costs[i]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+
         // Add detailed logging for debugging
         if (verbosity_level > 0) {
-            snprintf(result->error_message, sizeof(result->error_message), 
-                    "Debug: Creating solver with %d edges, %d nodes, root=%d, clusters=%d", 
+            snprintf(result->error_message, sizeof(result->error_message),
+                    "Debug: Creating solver with %d edges, %d nodes, root=%d, clusters=%d",
                     num_edges, num_nodes, cpp_root, target_num_active_clusters);
         }
-        
+
         // Create PCST solver
         PCSTFast solver(edges, prizes, costs, cpp_root, target_num_active_clusters,
                        pruning, verbosity_level, default_output_function);
-        
+
         // Add more detailed error reporting
         if (verbosity_level > 0) {
             strcpy(result->error_message, "Debug: Solver created, calling run()");
         }
-        
+
         // Solve
         vector<int> result_nodes_vec;
         vector<int> result_edges_vec;
-        
+
         bool success = solver.run(&result_nodes_vec, &result_edges_vec);
-        
+
+        // Debug: Log result
+        if (verbosity_level > 0) {
+            fprintf(stderr, "PCST Algorithm Result: success=%d, num_nodes=%zu, num_edges=%zu\n",
+                    success ? 1 : 0, result_nodes_vec.size(), result_edges_vec.size());
+            if (result_edges_vec.size() > 0) {
+                fprintf(stderr, "  Selected edges: ");
+                for (size_t i = 0; i < result_edges_vec.size() && i < 10; i++) {
+                    fprintf(stderr, "%d ", result_edges_vec[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
+
         if (success) {
             // Allocate memory for results
             result->num_nodes = result_nodes_vec.size();
             result->num_edges = result_edges_vec.size();
-            
+
             if (result->num_nodes > 0) {
                 result->result_nodes = (int*)malloc(result->num_nodes * sizeof(int));
                 if (!result->result_nodes) {
@@ -152,7 +190,7 @@ pcst_result_t* pcst_solve(
                     result->result_nodes[i] = result_nodes_vec[i];
                 }
             }
-            
+
             if (result->num_edges > 0) {
                 result->result_edges = (int*)malloc(result->num_edges * sizeof(int));
                 if (!result->result_edges) {
@@ -167,22 +205,22 @@ pcst_result_t* pcst_solve(
                     result->result_edges[i] = result_edges_vec[i];
                 }
             }
-            
+
             result->success = 1;
         } else {
             // Enhanced failure reporting
-            snprintf(result->error_message, sizeof(result->error_message), 
-                    "PCST algorithm failed: root=%d, clusters=%d, pruning=%d, nodes=%d, edges=%d", 
+            snprintf(result->error_message, sizeof(result->error_message),
+                    "PCST algorithm failed: root=%d, clusters=%d, pruning=%d, nodes=%d, edges=%d",
                     cpp_root, target_num_active_clusters, pruning_method, num_nodes, num_edges);
         }
-        
+
     } catch (const std::exception& e) {
-        snprintf(result->error_message, sizeof(result->error_message), 
+        snprintf(result->error_message, sizeof(result->error_message),
                 "Exception: %s", e.what());
     } catch (...) {
         strcpy(result->error_message, "Unknown exception occurred");
     }
-    
+
     return result;
 }
 
