@@ -1,3 +1,4 @@
+#include "postgres.h"
 #include "pcst_fast_c_wrapper.h"
 #include "pcst_fast.h"
 #include <cstring>
@@ -30,7 +31,7 @@ pcst_result_t* pcst_solve(
     int pruning_method,
     int verbosity_level
 ) {
-    pcst_result_t* result = (pcst_result_t*)malloc(sizeof(pcst_result_t));
+    pcst_result_t* result = (pcst_result_t*)palloc(sizeof(pcst_result_t));
     if (!result) {
         return nullptr;
     }
@@ -115,20 +116,19 @@ pcst_result_t* pcst_solve(
         // Handle root node (-1 means no root in C++ API)
         int cpp_root = (root_node < 0) ? PCSTFast::kNoRoot : root_node;
 
-        // Add detailed logging for debugging
+        // Add detailed logging for debugging (use elog, not error_message)
         if (verbosity_level > 0) {
-            snprintf(result->error_message, sizeof(result->error_message),
-                    "Debug: Creating solver with %d edges, %d nodes, root=%d, clusters=%d",
-                    num_edges, num_nodes, cpp_root, target_num_active_clusters);
+            elog(INFO, "pcst_solve: Creating solver with %d edges, %d nodes, root=%d, clusters=%d",
+                 num_edges, num_nodes, cpp_root, target_num_active_clusters);
         }
 
         // Create PCST solver
         PCSTFast solver(edges, prizes, costs, cpp_root, target_num_active_clusters,
                        pruning, verbosity_level, default_output_function);
 
-        // Add more detailed error reporting
+        // Add more detailed error reporting (use elog, not error_message)
         if (verbosity_level > 0) {
-            strcpy(result->error_message, "Debug: Solver created, calling run()");
+            elog(INFO, "pcst_solve: Solver created, calling run()");
         }
 
         // Solve
@@ -143,7 +143,7 @@ pcst_result_t* pcst_solve(
             result->num_edges = result_edges_vec.size();
 
             if (result->num_nodes > 0) {
-                result->result_nodes = (int*)malloc(result->num_nodes * sizeof(int));
+                result->result_nodes = (int*)palloc(result->num_nodes * sizeof(int));
                 if (!result->result_nodes) {
                     strcpy(result->error_message, "Failed to allocate memory for result nodes");
                     return result;
@@ -154,11 +154,11 @@ pcst_result_t* pcst_solve(
             }
 
             if (result->num_edges > 0) {
-                result->result_edges = (int*)malloc(result->num_edges * sizeof(int));
+                result->result_edges = (int*)palloc(result->num_edges * sizeof(int));
                 if (!result->result_edges) {
                     strcpy(result->error_message, "Failed to allocate memory for result edges");
                     if (result->result_nodes) {
-                        free(result->result_nodes);
+                        pfree(result->result_nodes);
                         result->result_nodes = nullptr;
                     }
                     return result;
@@ -169,6 +169,8 @@ pcst_result_t* pcst_solve(
             }
 
             result->success = 1;
+            // Clear error_message on success (it was initialized to empty string, but clear it explicitly)
+            strcpy(result->error_message, "");
         } else {
             // Enhanced failure reporting
             snprintf(result->error_message, sizeof(result->error_message),
@@ -189,12 +191,12 @@ pcst_result_t* pcst_solve(
 void pcst_free_result(pcst_result_t* result) {
     if (result) {
         if (result->result_nodes) {
-            free(result->result_nodes);
+            pfree(result->result_nodes);
         }
         if (result->result_edges) {
-            free(result->result_edges);
+            pfree(result->result_edges);
         }
-        free(result);
+        pfree(result);
     }
 }
 
