@@ -2,7 +2,6 @@
 #include "pcst_fast.h"
 #include <cstring>
 #include <cstdlib>
-#include <cstdio>
 #include <vector>
 #include <utility>
 
@@ -12,13 +11,9 @@ using std::pair;
 using std::make_pair;
 
 // Simple output function for C wrapper
-// Note: This is called from C++ code, so we can't use PostgreSQL's elog directly
-// Instead, we'll use fprintf to stderr, which PostgreSQL will capture if log_statement is set
 static void default_output_function(const char* message) {
-    // Output to stderr - PostgreSQL will capture this if client_min_messages is set appropriately
-    // This allows algorithm verbosity output to be seen
-    fprintf(stderr, "%s", message);
-    fflush(stderr);
+    // For PostgreSQL extension, we might want to use elog here
+    // For now, just ignore output to avoid issues
 }
 
 extern "C" {
@@ -120,25 +115,6 @@ pcst_result_t* pcst_solve(
         // Handle root node (-1 means no root in C++ API)
         int cpp_root = (root_node < 0) ? PCSTFast::kNoRoot : root_node;
 
-        // Debug: Log the data being passed to the algorithm
-        if (verbosity_level > 0) {
-            fprintf(stderr, "PCST Algorithm Input:\n");
-            fprintf(stderr, "  num_nodes=%d, num_edges=%d, root=%d, clusters=%d\n",
-                    num_nodes, num_edges, cpp_root, target_num_active_clusters);
-            fprintf(stderr, "  Prizes: ");
-            for (int i = 0; i < num_nodes && i < 10; i++) {
-                fprintf(stderr, "node[%d]=%.2f ", i, prizes[i]);
-            }
-            fprintf(stderr, "\n");
-            fprintf(stderr, "  Edges: ");
-            for (int i = 0; i < num_edges && i < 10; i++) {
-                fprintf(stderr, "edge[%d]: %d->%d cost=%.2f ",
-                        i, edges[i].first, edges[i].second, costs[i]);
-            }
-            fprintf(stderr, "\n");
-            fflush(stderr);
-        }
-
         // Add detailed logging for debugging
         if (verbosity_level > 0) {
             snprintf(result->error_message, sizeof(result->error_message),
@@ -160,20 +136,6 @@ pcst_result_t* pcst_solve(
         vector<int> result_edges_vec;
 
         bool success = solver.run(&result_nodes_vec, &result_edges_vec);
-
-        // Debug: Log result
-        if (verbosity_level > 0) {
-            fprintf(stderr, "PCST Algorithm Result: success=%d, num_nodes=%zu, num_edges=%zu\n",
-                    success ? 1 : 0, result_nodes_vec.size(), result_edges_vec.size());
-            if (result_edges_vec.size() > 0) {
-                fprintf(stderr, "  Selected edges: ");
-                for (size_t i = 0; i < result_edges_vec.size() && i < 10; i++) {
-                    fprintf(stderr, "%d ", result_edges_vec[i]);
-                }
-                fprintf(stderr, "\n");
-            }
-            fflush(stderr);
-        }
 
         if (success) {
             // Allocate memory for results

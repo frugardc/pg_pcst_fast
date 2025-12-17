@@ -134,24 +134,43 @@ run_tests() {
         # Store output with test name prefix for later extraction (fallback)
         all_outputs="${all_outputs}=== $test_name ==="$'\n'"${output}"$'\n'
 
-        # Parse pgTAP summary line: "# Looks like you failed X tests of Y"
+        # Parse pgTAP summary line: "# Looks like you failed X test(s) of Y"
+        # or "# Looks like you planned X tests"
         # This is the most reliable way to get test counts
         tap_summary=$(echo "$output" | grep -E "# Looks like you" | head -1)
 
         if [ -n "$tap_summary" ]; then
-            # Extract numbers from summary: "failed X tests of Y"
-            failed_from_summary=$(echo "$tap_summary" | sed -n 's/.*failed \([0-9]*\) test.*/\1/p')
-            total_from_summary=$(echo "$tap_summary" | sed -n 's/.*tests of \([0-9]*\)/\1/p')
+            # Check if it's a failure summary: "failed X test(s) of Y"
+            if echo "$tap_summary" | grep -q "failed"; then
+                # Extract numbers from summary: "failed X test(s) of Y"
+                # Handle both singular "test" and plural "tests"
+                failed_from_summary=$(echo "$tap_summary" | sed -n 's/.*failed \([0-9]*\) test.*/\1/p')
+                # Match "test of" or "tests of" followed by number
+                total_from_summary=$(echo "$tap_summary" | sed -n 's/.*test[s]* of \([0-9]*\).*/\1/p')
 
-            if [ -n "$failed_from_summary" ] && [ -n "$total_from_summary" ]; then
-                fail_count=${failed_from_summary:-0}
-                test_count=${total_from_summary:-0}
-                passed_count=$((test_count - fail_count))
+                if [ -n "$failed_from_summary" ] && [ -n "$total_from_summary" ]; then
+                    fail_count=$failed_from_summary
+                    test_count=$total_from_summary
+                    passed_count=$((test_count - fail_count))
+                else
+                    # Fallback: count individual test lines
+                    passed_count=$(echo "$output" | grep -E "^ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
+                    fail_count=$(echo "$output" | grep -E "^not ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
+                    test_count=$((passed_count + fail_count))
+                fi
             else
-                # Fallback: count individual test lines
-                passed_count=$(echo "$output" | grep -E "^ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
-                fail_count=$(echo "$output" | grep -E "^not ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
-                test_count=$((passed_count + fail_count))
+                # Check if it's a "planned X tests" summary (all passed)
+                planned_from_summary=$(echo "$tap_summary" | sed -n 's/.*planned \([0-9]*\) test.*/\1/p')
+                if [ -n "$planned_from_summary" ]; then
+                    test_count=$planned_from_summary
+                    fail_count=0
+                    passed_count=$test_count
+                else
+                    # Fallback: count individual test lines
+                    passed_count=$(echo "$output" | grep -E "^ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
+                    fail_count=$(echo "$output" | grep -E "^not ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
+                    test_count=$((passed_count + fail_count))
+                fi
             fi
         else
             # No summary line found, count individual test lines
@@ -185,18 +204,33 @@ run_tests() {
             fi
         fi
 
-        # Add to totals (test_count already calculated above)
-        total_tests=$((total_tests + test_count))
-        passed_tests=$((passed_tests + passed_count))
-        failed_tests=$((failed_tests + fail_count))
-
-        # Extract failed test names for display
+        # Extract failed test names for display (before adding to totals, so we can use as fallback)
         # Try multiple patterns to catch all variations
         failed_test_lines=$(echo "$output" | grep -E "^not ok[[:space:]]+[0-9]" 2>/dev/null || true)
         # Fallback: if no matches, try without requiring space after "ok"
         if [ -z "$failed_test_lines" ]; then
             failed_test_lines=$(echo "$output" | grep -E "^not ok" 2>/dev/null || true)
         fi
+
+        # Additional check: if we found "not ok" lines but fail_count is 0, there's a parsing issue
+        # In this case, we should treat it as a failure and update counts
+        if [ -n "$failed_test_lines" ] && [ "$fail_count" -eq 0 ]; then
+            # Count actual failed tests from the lines
+            actual_fail_count=$(echo "$failed_test_lines" | wc -l | tr -d ' ')
+            fail_count=$actual_fail_count
+            if [ "$test_count" -eq 0 ]; then
+                # Try to count total tests from output
+                passed_lines=$(echo "$output" | grep -E "^ok[[:space:]]+[0-9]" 2>/dev/null | wc -l | tr -d ' ')
+                test_count=$((passed_lines + actual_fail_count))
+            fi
+            # Recalculate passed_count
+            passed_count=$((test_count - fail_count))
+        fi
+
+        # Add to totals (test_count already calculated above)
+        total_tests=$((total_tests + test_count))
+        passed_tests=$((passed_tests + passed_count))
+        failed_tests=$((failed_tests + fail_count))
 
         # Show output
         echo "$output"
