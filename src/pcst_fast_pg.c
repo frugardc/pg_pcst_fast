@@ -500,6 +500,7 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                     PG_TRY();
                     {
                         node_map_entry *hentry;
+                        bool broke_early = false;
 
                         hash_seq_init(&hash_seq, node_map);
                         hash_seq_initialized = true;
@@ -507,8 +508,18 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                             if (hentry->node_id != NULL && text_cmp(hentry->node_id, node_id_text) == 0) {
                                 entry = hentry;
                                 found = true;
+                                broke_early = true;
                                 break;
                             }
+                        }
+                        // Only terminate if we broke early - if loop completed normally (returned NULL),
+                        // the scan is already terminated by PostgreSQL
+                        if (hash_seq_initialized && broke_early) {
+                            hash_seq_term(&hash_seq);
+                            hash_seq_initialized = false;
+                        } else if (hash_seq_initialized) {
+                            // Loop completed normally, scan already terminated, just reset flag
+                            hash_seq_initialized = false;
                         }
                     }
                     PG_CATCH();
@@ -521,11 +532,6 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                         PG_RE_THROW();
                     }
                     PG_END_TRY();
-                }
-
-                // Always terminate hash sequence scan if we initialized it
-                if (hash_seq_initialized) {
-                    hash_seq_term(&hash_seq);
                 }
 
                 // Debug: log lookup result (first few only)
@@ -575,7 +581,9 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                                  node_id_str, prize);
                         }
                     } else if (nodes_not_found == 11) {
-                        elog(WARNING, "pgr_pcst_fast: Additional prize nodes not found in edges (suppressing further warnings)");
+                        if (verbosity > 0) {
+                            elog(WARNING, "pgr_pcst_fast: Additional prize nodes not found in edges (suppressing further warnings)");
+                        }
                     }
                     pfree(node_id_str);
                 }
@@ -584,8 +592,8 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                 pfree(node_id_text);
             }
 
-            // Summary of node matching
-            if (verbosity > 0 || nodes_not_found > 0) {
+            // Summary of node matching (only if verbosity > 0)
+            if (verbosity > 0) {
                 elog(INFO, "pgr_pcst_fast: Nodes query summary: %lu rows processed, %d matched, %d not found in edges",
                      SPI_processed, nodes_matched, nodes_not_found);
                 if (nodes_not_found > 0) {
@@ -690,6 +698,7 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                     PG_TRY();
                     {
                         node_map_entry *hentry;
+                        bool broke_early = false;
 
                         hash_seq_init(&hash_seq, node_map);
                         hash_seq_initialized = true;
@@ -697,8 +706,18 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                             if (hentry->node_id != NULL && text_cmp(hentry->node_id, root_id) == 0) {
                                 entry = hentry;
                                 found = true;
+                                broke_early = true;
                                 break;
                             }
+                        }
+                        // Only terminate if we broke early - if loop completed normally (returned NULL),
+                        // the scan is already terminated by PostgreSQL
+                        if (hash_seq_initialized && broke_early) {
+                            hash_seq_term(&hash_seq);
+                            hash_seq_initialized = false;
+                        } else if (hash_seq_initialized) {
+                            // Loop completed normally, scan already terminated, just reset flag
+                            hash_seq_initialized = false;
                         }
                     }
                     PG_CATCH();
@@ -711,11 +730,6 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                         PG_RE_THROW();
                     }
                     PG_END_TRY();
-                }
-
-                // Always terminate hash sequence scan if we initialized it
-                if (hash_seq_initialized) {
-                    hash_seq_term(&hash_seq);
                 }
 
                 if (!found || entry == NULL) {
@@ -733,9 +747,11 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                                     root_id_str, root_index, num_nodes - 1)));
                 }
 
-                // Always log root node mapping for debugging (even if verbosity=0 when root is specified)
-                elog(INFO, "pgr_pcst_fast: Root node ID '%s' mapped to index %d (num_nodes=%d)",
-                     root_id_str, root_index, num_nodes);
+                // Log root node mapping for debugging (only if verbosity > 0)
+                if (verbosity > 0) {
+                    elog(INFO, "pgr_pcst_fast: Root node ID '%s' mapped to index %d (num_nodes=%d)",
+                         root_id_str, root_index, num_nodes);
+                }
 
                 pfree(root_id_str);
             }
@@ -831,8 +847,8 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
         // (see pcst_fast.cc line 304: "target_num_active_clusters must be 0 in the rooted case")
         int effective_num_clusters = (root_index >= 0) ? 0 : num_clusters;
 
-        // Debug: Log parameters before calling algorithm (always log when root is specified)
-        if (root_index >= 0 || verbosity > 0) {
+        // Debug: Log parameters before calling algorithm (only if verbosity > 0)
+        if (verbosity > 0) {
             if (root_index >= 0 && num_clusters != 0) {
                 elog(INFO, "pgr_pcst_fast: Root node specified - setting num_clusters from %d to 0 (required by algorithm)",
                      num_clusters);
@@ -854,11 +870,6 @@ Datum pcst_fast_pgr(PG_FUNCTION_ARGS) {
                      (root_index >= 0 && root_index < num_nodes) ? "YES" : "NO",
                      root_found_in_edges ? "YES" : "NO");
             }
-        }
-
-        if (root_index >= 0 && num_clusters != 0 && verbosity > 0) {
-            elog(INFO, "pgr_pcst_fast: Root node specified - setting num_clusters from %d to 0 (required by algorithm)",
-                 num_clusters);
         }
 
         // Call the C function (may modify the costs array)
